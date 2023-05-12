@@ -112,28 +112,40 @@ pub fn new_partial(
 
 	let slot_duration = sc_consensus_aura::slot_duration(&*client)?;
 
-	let import_queue =
-		sc_consensus_aura::import_queue::<AuraPair, _, _, _, _, _>(ImportQueueParams {
-			block_import: grandpa_block_import.clone(),
-			justification_import: Some(Box::new(grandpa_block_import.clone())),
-			client: client.clone(),
-			create_inherent_data_providers: move |_, ()| async move {
-				let timestamp = sp_timestamp::InherentDataProvider::from_system_time();
+	let import_queue = {
+		let tendermint_block_import =
+			tendermint_consensus::TendermintBlockImport::new(client.clone());
+		let tendermint_import_queue = tendermint_consensus::import_queue(
+			tendermint_block_import.clone(),
+			Some(Box::new(tendermint_block_import.clone())),
+			&task_manager.spawn_essential_handle(),
+			config.prometheus_registry(),
+		)?;
+		tendermint_import_queue
+	};
 
-				let slot =
-					sp_consensus_aura::inherents::InherentDataProvider::from_timestamp_and_slot_duration(
-						*timestamp,
-						slot_duration,
-					);
+	// let import_queue =
+	// 	sc_consensus_aura::import_queue::<AuraPair, _, _, _, _, _>(ImportQueueParams {
+	// 		block_import: grandpa_block_import.clone(),
+	// 		justification_import: Some(Box::new(grandpa_block_import.clone())),
+	// 		client: client.clone(),
+	// 		create_inherent_data_providers: move |_, ()| async move {
+	// 			let timestamp = sp_timestamp::InherentDataProvider::from_system_time();
 
-				Ok((slot, timestamp))
-			},
-			spawner: &task_manager.spawn_essential_handle(),
-			registry: config.prometheus_registry(),
-			check_for_equivocation: Default::default(),
-			telemetry: telemetry.as_ref().map(|x| x.handle()),
-			compatibility_mode: Default::default(),
-		})?;
+	// 			let slot =
+	// 				sp_consensus_aura::inherents::InherentDataProvider::from_timestamp_and_slot_duration(
+	// 					*timestamp,
+	// 					slot_duration,
+	// 				);
+
+	// 			Ok((slot, timestamp))
+	// 		},
+	// 		spawner: &task_manager.spawn_essential_handle(),
+	// 		registry: config.prometheus_registry(),
+	// 		check_for_equivocation: Default::default(),
+	// 		telemetry: telemetry.as_ref().map(|x| x.handle()),
+	// 		compatibility_mode: Default::default(),
+	// 	})?;
 
 	Ok(sc_service::PartialComponents {
 		client,
@@ -256,14 +268,11 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 
 		let slot_duration = sc_consensus_aura::slot_duration(&*client)?;
 
-		let aura = sc_consensus_aura::start_aura::<AuraPair, _, _, _, _, _, _, _, _, _, _>(
-			StartAuraParams {
+		let tendermint =
+			tendermint_consensus::start_tenderming::<AuraPair, _, _, _, _, _, _, _, _, _, _>(
 				slot_duration,
-				client,
 				select_chain,
-				block_import,
-				proposer_factory,
-				create_inherent_data_providers: move |_, ()| async move {
+				move |_, ()| async move {
 					let timestamp = sp_timestamp::InherentDataProvider::from_system_time();
 
 					let slot =
@@ -274,23 +283,57 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 
 					Ok((slot, timestamp))
 				},
+				client,
+				block_import,
+				proposer_factory,
+				sync_service.clone(),
+				sync_service.clone(),
 				force_authoring,
-				backoff_authoring_blocks,
-				keystore: keystore_container.sync_keystore(),
-				sync_oracle: sync_service.clone(),
-				justification_sync_link: sync_service.clone(),
-				block_proposal_slot_portion: SlotProportion::new(2f32 / 3f32),
-				max_block_proposal_slot_portion: None,
-				telemetry: telemetry.as_ref().map(|x| x.handle()),
-				compatibility_mode: Default::default(),
-			},
-		)?;
+				keystore_container.sync_keystore(),
+				telemetry.as_ref().map(|x| x.handle()),
+			)?;
+
+		// let aura = sc_consensus_aura::start_aura::<AuraPair, _, _, _, _, _, _, _, _, _, _>(
+		// 	StartAuraParams {
+		// 		slot_duration,
+		// 		client,
+		// 		select_chain,
+		// 		block_import,
+		// 		proposer_factory,
+		// 		create_inherent_data_providers: move |_, ()| async move {
+		// 			let timestamp = sp_timestamp::InherentDataProvider::from_system_time();
+
+		// 			let slot =
+		// 				sp_consensus_aura::inherents::InherentDataProvider::from_timestamp_and_slot_duration(
+		// 					*timestamp,
+		// 					slot_duration,
+		// 				);
+
+		// 			Ok((slot, timestamp))
+		// 		},
+		// 		force_authoring,
+		// 		backoff_authoring_blocks,
+		// 		keystore: keystore_container.sync_keystore(),
+		// 		sync_oracle: sync_service.clone(),
+		// 		justification_sync_link: sync_service.clone(),
+		// 		block_proposal_slot_portion: SlotProportion::new(2f32 / 3f32),
+		// 		max_block_proposal_slot_portion: None,
+		// 		telemetry: telemetry.as_ref().map(|x| x.handle()),
+		// 		compatibility_mode: Default::default(),
+		// 	},
+		// )?;
 
 		// the AURA authoring task is considered essential, i.e. if it
 		// fails we take down the service with it.
-		task_manager
-			.spawn_essential_handle()
-			.spawn_blocking("aura", Some("block-authoring"), aura);
+		// task_manager
+		// 	.spawn_essential_handle()
+		// 	.spawn_blocking("aura", Some("block-authoring"), aura);
+
+		task_manager.spawn_essential_handle().spawn_blocking(
+			"tendermint",
+			Some("block-authoring"),
+			tendermint,
+		);
 	}
 
 	if enable_grandpa {
