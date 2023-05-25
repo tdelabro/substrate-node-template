@@ -1,4 +1,12 @@
-use std::{fmt::Debug, future::Future, hash::Hash, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{
+	fmt::Debug,
+	future::Future,
+	hash::Hash,
+	marker::PhantomData,
+	pin::Pin,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use futures::prelude::*;
 
@@ -6,10 +14,13 @@ use codec::{Codec, Decode, Encode};
 use sc_consensus::{BlockImport, BlockImportParams, ForkChoiceStrategy, StateAction};
 use sc_consensus_aura::{AuraApi, CompatibleDigestItem};
 use sc_consensus_slots::{
-	InherentDataProviderExt, SimpleSlotWorker, SimpleSlotWorkerToSlotWorker, SlotProportion,
-	StorageChanges,
+	InherentDataProviderExt, SimpleSlotWorker, SimpleSlotWorkerToSlotWorker, SlotInfo,
+	SlotProportion, SlotResult, StorageChanges,
 };
-use sc_telemetry::{log::debug, TelemetryHandle};
+use sc_telemetry::{
+	log::{debug, info, warn},
+	telemetry, TelemetryHandle, CONSENSUS_DEBUG, CONSENSUS_INFO, CONSENSUS_WARN,
+};
 use sp_api::{HeaderT, ProvideRuntimeApi};
 use sp_consensus::{BlockOrigin, Environment, Proposer, SelectChain, SyncOracle};
 use sp_consensus_slots::{Slot, SlotDuration};
@@ -22,7 +33,7 @@ use sp_runtime::{
 	DigestItem,
 };
 
-use crate::{block_import, TENDERMINT_ENGINE_ID};
+use crate::TENDERMINT_ENGINE_ID;
 
 pub struct TendermintWorker<C, E, I, L, P, SO> {
 	client: Arc<C>,
@@ -45,7 +56,7 @@ where
 	B: BlockT,
 	C: ProvideRuntimeApi<B> + Send + Sync,
 	I: BlockImport<B, Transaction = Transaction> + Send + Sync + 'static,
-	SO: SyncOracle + Sync,
+	SO: SyncOracle + Send + Sync,
 	E: Environment<B, Error = Error> + Send + Sync,
 	E::Proposer: Proposer<B, Error = Error, Transaction = Transaction>,
 	Error: std::error::Error + Send + From<sp_consensus::Error> + 'static,
@@ -198,6 +209,175 @@ where
 			sc_consensus_slots::SlotLenienceType::Exponential,
 			self.logging_target(),
 		)
+	}
+
+	/// Implements [`SlotWorker::on_slot`].
+	async fn on_slot(
+		&mut self,
+		slot_info: SlotInfo<B>,
+	) -> Option<SlotResult<B, <Self::Proposer as Proposer<B>>::Proof>>
+	where
+		Self: Sync,
+	{
+		let slot = slot_info.slot;
+		let telemetry = self.telemetry();
+		let logging_target = self.logging_target();
+
+		let proposing_remaining_duration = self.proposing_remaining_duration(&slot_info);
+
+		let end_proposing_at = if proposing_remaining_duration == Duration::default() {
+			debug!(
+				target: logging_target,
+				"Skipping proposal slot {} since there's no time left to propose", slot,
+			);
+
+			return None
+		} else {
+			Instant::now() + proposing_remaining_duration
+		};
+
+		let aux_data = match self.aux_data(&slot_info.chain_head, slot) {
+			Ok(aux_data) => aux_data,
+			Err(err) => {
+				warn!(
+					target: logging_target,
+					"Unable to fetch auxiliary data for block {:?}: {}",
+					slot_info.chain_head.hash(),
+					err,
+				);
+
+				telemetry!(
+					telemetry;
+					CONSENSUS_WARN;
+					"slots.unable_fetching_authorities";
+					"slot" => ?slot_info.chain_head.hash(),
+					"err" => ?err,
+				);
+
+				return None
+			},
+		};
+
+		self.notify_slot(&slot_info.chain_head, slot, &aux_data);
+
+		let authorities_len = self.authorities_len(&aux_data);
+
+		if !self.force_authoring() &&
+			self.sync_oracle().is_offline() &&
+			authorities_len.map(|a| a > 1).unwrap_or(false)
+		{
+			debug!(target: logging_target, "Skipping proposal slot. Waiting for the network.");
+			telemetry!(
+				telemetry;
+				CONSENSUS_DEBUG;
+				"slots.skipping_proposal_slot";
+				"authorities_len" => authorities_len,
+			);
+
+			return None
+		}
+
+		let claim = self.claim_slot(&slot_info.chain_head, slot, &aux_data).await?;
+
+		if self.should_backoff(slot, &slot_info.chain_head) {
+			return None
+		}
+
+		debug!(target: logging_target, "Starting authorship at slot: {slot}");
+
+		telemetry!(telemetry; CONSENSUS_DEBUG; "slots.starting_authorship"; "slot_num" => slot);
+
+		let proposer = match self.proposer(&slot_info.chain_head).await {
+			Ok(p) => p,
+			Err(err) => {
+				warn!(target: logging_target, "Unable to author block in slot {slot:?}: {err}");
+
+				telemetry!(
+					telemetry;
+					CONSENSUS_WARN;
+					"slots.unable_authoring_block";
+					"slot" => *slot,
+					"err" => ?err
+				);
+
+				return None
+			},
+		};
+
+		let proposal = self.propose(proposer, &claim, slot_info, end_proposing_at).await?;
+
+		let (block, storage_proof) = (proposal.block, proposal.proof);
+		let (header, body) = block.deconstruct();
+		let header_num = *header.number();
+		let header_hash = header.hash();
+		let parent_hash = *header.parent_hash();
+
+
+		// Here goes the round logic
+
+
+		let block_import_params = match self
+			.block_import_params(
+				header,
+				&header_hash,
+				body.clone(),
+				proposal.storage_changes,
+				claim,
+				aux_data,
+			)
+			.await
+		{
+			Ok(bi) => bi,
+			Err(err) => {
+				warn!(target: logging_target, "Failed to create block import params: {}", err);
+
+				return None
+			},
+		};
+
+		info!(
+			target: logging_target,
+			"🔖 Pre-sealed block for proposal at {}. Hash now {:?}, previously {:?}.",
+			header_num,
+			block_import_params.post_hash(),
+			header_hash,
+		);
+
+		telemetry!(
+			telemetry;
+			CONSENSUS_INFO;
+			"slots.pre_sealed_block";
+			"header_num" => ?header_num,
+			"hash_now" => ?block_import_params.post_hash(),
+			"hash_previously" => ?header_hash,
+		);
+
+		let header = block_import_params.post_header();
+		match self.block_import().import_block(block_import_params).await {
+			Ok(res) => {
+				res.handle_justification(
+					&header.hash(),
+					*header.number(),
+					self.justification_sync_link(),
+				);
+			},
+			Err(err) => {
+				warn!(
+					target: logging_target,
+					"Error with block built on {:?}: {}", parent_hash, err,
+				);
+
+				telemetry!(
+					telemetry;
+					CONSENSUS_WARN;
+					"slots.err_with_block_built_on";
+					"hash" => ?parent_hash,
+					"err" => ?err,
+				);
+			},
+		}
+
+		Some(SlotResult { block: B::new(header, body), storage_proof })
 	}
 }
 

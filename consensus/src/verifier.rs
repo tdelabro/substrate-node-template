@@ -17,7 +17,7 @@ impl<B: BlockT> TendermintVerifier<B> {
 impl<B: BlockT> Verifier<B> for TendermintVerifier<B> {
 	async fn verify(
 		&mut self,
-		mut block: BlockImportParams<B, ()>,
+		block: BlockImportParams<B, ()>,
 	) -> Result<BlockImportParams<B, ()>, String> {
 		Ok(block)
 	}

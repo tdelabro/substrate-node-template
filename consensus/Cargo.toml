@@ -6,8 +6,6 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tendermint = { path = "/Users/tdelabro/Documents/code/tendermint-rs/tendermint", default-features = false }
-
 sp-runtime = { default-features = false, git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v0.9.40" }
 sp-consensus = { git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v0.9.40" }
 sp-api = { git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v0.9.40" }
@@ -31,6 +29,23 @@ async-trait = "0.1.68"
 prometheus = { version = "0.13.3", default-features = false }
 futures = { version = "0.3.21", features = ["thread-pool"] }
 serde = { version = "1.0.163", default-features = false }
+tracing = { version = "0.1", default-features = false, optional = true }
 
 
 sc-consensus-aura = { git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v0.9.40" }
+sc-keystore = { git = "https://github.com/paritytech/substrate.git", branch = "polkadot-v0.9.40" }
+tokio = { version = "1.22.0", features = ["full"] }
+time = "0.3"
+rand = "0.8.5"
+yaml-rust = "0.4.5"
+tempfile = "3.5.0"
+assert_matches = "1.5.0"
+
+
+[features]
+default = ["trace"]
+trace = ["tracing"]
+
+[[test]]
+name = "consensus"
+path = "tests/consensus.rs"

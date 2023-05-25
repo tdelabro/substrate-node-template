@@ -1,5 +1,7 @@
 mod block_import;
 mod import_queue;
+mod proposer;
+pub mod tendermint;
 mod verifier;
 mod worker;
 
